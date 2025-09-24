@@ -26,6 +26,12 @@ class CountDict(dict):
 
     def sort(self):
         return self.__class__(sorted(self.items(), key=lambda item: item[1], reverse=True))
+    
+    def __sub__(self, other):
+        res = {}
+        for key in set(list(self.keys()) + list(other.keys())):
+            res[key] = self.get(key, 0) - other.get(key, 0)
+        return self.__class__(res)
 
 class Tokenizer:
 
@@ -129,13 +135,11 @@ class Tokenizer:
             in_queue = manager.Queue()
 
             pool = []
-            print("start processes")
             for _ in range(num_processes):
                 p = mp.Process(target=self._pretokenize_parallell, args=(in_queue, out_list))
                 p.start()
                 pool.append(p)
 
-            print("produce data")
             with open(file, "rb") as f:
                 boundaries = self._find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
                 
@@ -151,12 +155,16 @@ class Tokenizer:
             for p in pool:
                 p.join()
 
-            print("update counts")
             for res in out_list:
                 counts.update(res)
 
         self.counts.update(counts)
         self.counts = self.counts.sort()
+
+    def _adj_pairs(self, sequence):
+        if len(sequence) <= 1:
+            return []
+        return [(x1, x2) for x1, x2 in zip(sequence[:-1], sequence[1:])]
 
     def _train_loop(self, byte_pairs: CountDict, vocab: dict, num_merges: int):
 
@@ -177,73 +185,62 @@ class Tokenizer:
                 else:
                     new_key.append(old_key[ind])
                 ind += 1
-            assert len(old_key) - len(replace_at) == len(new_key)
             return tuple(new_key)
+        
+        def _count_byte_pair_change(new_key, old_key):
+            new_byte_pairs = CountDict()
+            for pair in self._adj_pairs(new_key):
+                new_byte_pairs.update({pair: 1})
+            old_byte_pairs = CountDict()
+            for pair in self._adj_pairs(old_key):
+                old_byte_pairs.update({pair: 1})
+            return new_byte_pairs - old_byte_pairs
 
         merges = []
         for iter in range(num_merges):
             # Find the lexicographically greatest, most occuring pair
             max_val = -1
-            max_byte_pairs = []
+            max_byte_pairs = {}
             for key, value in byte_pairs.items():
                 if max_val == -1:
                     max_val = value
                 if value >= max_val:
-                    max_byte_pairs.append(key)
+                    max_byte_pairs[(vocab[key[0]], vocab[key[1]])] = key
                 else:
                     break
-            max_pair = max(max_byte_pairs)
+            max_pair = max_byte_pairs[max(max_byte_pairs)]
 
             # Next free position in vocabulary, this will be the encoding value
             # for the byte pair
             tk_ind = len(vocab)
 
             # Find byte pairs affected by the comming merge
-            affected_pairs = CountDict()
+            #affected_pairs = CountDict()
             edit_keys = []
             for key, count in self.counts.items():
                 found = _contains(key, max_pair)
-                for ind in found:
-                    if ind != 0:
-                        if ind == len(key) - 1:
-                            affected_pairs.update({(key[ind - 1], key[ind]): count})
-                        else:
-                            affected_pairs.update({(key[ind - 1], key[ind], key[ind + 1]): count})
-                    if ind < len(key) - 2:
-                        affected_pairs.update({(key[ind], key[ind + 1], key[ind + 2]): count})
                 if found:
                     new_key = _update_key(key, tk_ind, found)
                     edit_keys.append((key, new_key))
+                    # Update counts in byte pairs
+                    btp_change = _count_byte_pair_change(new_key, key)
+                    for btp, change in btp_change.items():
+                        byte_pairs[btp] = byte_pairs.get(btp, 0) + change * count
+                        if byte_pairs[btp] == 0:
+                            # Remove byte pair
+                            del byte_pairs[btp]
+                        elif byte_pairs[btp] < 0:
+                            raise ValueError("Something has gone terribly wrong...")                            
 
             # Update pretoken counts
             for (old_key, new_key) in edit_keys:
                 self.counts[new_key] = self.counts.pop(old_key)
 
-            # Update counts in byte pairs
-            for key, count in affected_pairs.items():
-                if (key[0], key[1]) == max_pair:
-                    edit_key = (key[1], key[2])
-                    new_key = (tk_ind, key[2])
-                elif (key[1], key[2]) == max_pair:
-                    edit_key = (key[0], key[1])
-                    new_key = (key[0], tk_ind)
-                else:
-                    raise IndexError("Uh Oh")
-                if edit_key not in byte_pairs:
-                    raise KeyError("Something has gone terribly wrong...")
-                if byte_pairs[edit_key] == count:
-                    # Replace it
-                    del byte_pairs[edit_key]
-                else:
-                    byte_pairs[edit_key] = byte_pairs[edit_key] - count
-                byte_pairs[new_key] = count
-            # Remove merged pair
-            del byte_pairs[max_pair]
-            # Re-sort it
+            # Re-sort byte pairs
             byte_pairs = byte_pairs.sort()
 
             # Add to merge list
-            merges.append(max_pair)
+            merges.append((vocab[max_pair[0]], vocab[max_pair[1]]))
             # Update vocabulary
             vocab[len(vocab)] = vocab[max_pair[0]] + vocab[max_pair[1]]
         return vocab, merges
@@ -255,8 +252,6 @@ class Tokenizer:
         self.pretokenize(Path(input_path), self.num_processes)
 
         # Init vocabulary
-        # vocab = {i: spt for i, spt in enumerate(special_tokens)}
-        # offset = len(special_tokens
         vocab = {}
         for i in range(256):
             vocab[i] = bytes([i])
@@ -268,10 +263,14 @@ class Tokenizer:
                 byte_pairs.update({(b1, b2): count})
         byte_pairs = byte_pairs.sort()
 
-        vocab, merges = self._train_loop(byte_pairs, vocab, num_merges=max(vocab_size - 256, 0))
+        vocab, merges = self._train_loop(
+            byte_pairs,
+            vocab,
+            num_merges=max(vocab_size - 256 - len(special_tokens), 0)
+        )
         i = len(vocab)
         for spt in special_tokens:
-            vocab[i] = spt
+            vocab[i] = bytes(spt, encoding='utf-8')
             i += 1
 
         self.vocab = vocab
