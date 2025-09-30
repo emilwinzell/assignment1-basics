@@ -262,7 +262,7 @@ class Tokenizer:
             vocab[len(vocab)] = vocab[max_pair[0]] + vocab[max_pair[1]]
         return vocab, merges
 
-    def train(self, input_path: str, vocab_size: int, special_tokens: list[str]):
+    def train(self, input_path: str, vocab_size: int):
 
         # Pre-tokenize
         st_time = time()
@@ -284,10 +284,10 @@ class Tokenizer:
         vocab, merges = self._train_loop(
             byte_pairs,
             vocab,
-            num_merges=max(vocab_size - 256 - len(special_tokens), 0)
+            num_merges=max(vocab_size - 256 - len(self.special_tokens), 0)
         )
         i = len(vocab)
-        for spt in special_tokens:
+        for spt in self.special_tokens:
             vocab[i] = bytes(spt, encoding='utf-8')
             i += 1
 
