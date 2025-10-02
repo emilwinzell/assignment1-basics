@@ -40,11 +40,13 @@ class Tokenizer:
     def __init__(self, special_tokens: list[str] = None, num_processes: int = 4,
                  vocab: dict = None, merges: list = None):
         self.counts = CountDict()
-        self.special_tokens = [re.escape(spt) for spt in special_tokens] if special_tokens else []
+        self.special_tokens = special_tokens if special_tokens else []
+        self.special_tokens.sort(key=len, reverse=True)  # Longest first
         self.num_processes = num_processes
         self.vocab = vocab if vocab else {}
         self._vocab_list = list(self.vocab.values())
         self.merges = merges if merges else []
+        self.windows_platform = True if os.name == 'nt' else False
 
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str,
@@ -104,19 +106,29 @@ class Tokenizer:
         # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
         return sorted(set(chunk_boundaries))
     
-    def _pretokenize_chunk(self, chunk: str) -> list[tuple]:
+    def _pretokenize_chunk(self, chunk: str) -> list[re.Scanner | str]:
+        """Splits text chunks into suitable pre-tokens
+        
+        Returns
+        -------
+        list
+            List with re.Scanner objects or strings for special characters
+        """
         words = []
         if self.special_tokens:
-            sub_chunks = re.split(rf"{'|'.join(self.special_tokens)}", chunk)
+            special_tks = [re.escape(spt) for spt in self.special_tokens]
+            sub_chunks = re.split(rf"({'|'.join(special_tks)})", chunk)
         else:
             sub_chunks = [chunk]
 
         for subch in sub_chunks:
+            if self.windows_platform:
+                subch = re.sub(r"\r\n", "\n", subch)
             tk_iter = re.finditer(
                 r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""",
                 subch
-            )
-            words += [tuple(bytes(match.group(), encoding="utf-8")) for match in tk_iter]
+            ) if subch not in self.special_tokens else subch
+            words.append(tk_iter)
         return words
     
     def _pretokenize_parallell(self, in_queue, out_list):
@@ -125,8 +137,17 @@ class Tokenizer:
             if chunk is None:
                 return
             chunk = chunk.decode("utf-8", errors="ignore")
-            counts = self._pretokenize_chunk(chunk)
+            counts = self._count_pretokens(self._pretokenize_chunk(chunk))
             out_list.append(counts)
+    
+    def _count_pretokens(self, ptks: list[re.Scanner]) -> CountDict:
+        counts = CountDict()
+        for ptk in ptks:
+            if isinstance(ptk, str):
+                continue  # no need to count special tokens
+            for match in ptk:
+                counts.update({tuple(bytes(match.group(), encoding="utf-8")): 1})
+        return counts
 
     def pretokenize(self, file: Path, num_processes: int = 4):
         """Read file and store token counts.
@@ -144,8 +165,7 @@ class Tokenizer:
                 chunk = f.read()
                 # Run pre-tokenization on your chunk and store the counts for each pre-token
                 chunk = chunk.decode("utf-8", errors="ignore")
-                for ptk in self._pretokenize_chunk(chunk):
-                    counts.update({ptk: 1})
+                counts = self._count_pretokens(self._pretokenize_chunk(chunk))
         else:
             manager = mp.Manager()
             out_list = manager.list()
@@ -173,8 +193,7 @@ class Tokenizer:
                 p.join()
 
             for res in out_list:
-                for ptk in res:
-                    counts.update({ptk: 1})
+                counts.update(res)
 
         self.counts.update(counts)
         self.counts = self.counts.sort()
@@ -184,7 +203,7 @@ class Tokenizer:
             return []
         return [(x1, x2) for x1, x2 in zip(sequence[:-1], sequence[1:])]
 
-    def _train_loop(self, byte_pairs: CountDict, vocab: dict, num_merges: int):
+    def _train_loop(self, byte_pairs: CountDict, num_merges: int):
 
         def _contains(target: tuple[int], check: tuple[int]):
             return [
@@ -222,17 +241,16 @@ class Tokenizer:
                 if max_val == -1:
                     max_val = value
                 if value >= max_val:
-                    max_byte_pairs[(vocab[key[0]], vocab[key[1]])] = key
+                    max_byte_pairs[(self.vocab[key[0]], self.vocab[key[1]])] = key
                 else:
                     break
             max_pair = max_byte_pairs[max(max_byte_pairs)]
 
             # Next free position in vocabulary, this will be the encoding value
             # for the byte pair
-            tk_ind = len(vocab)
+            tk_ind = len(self.vocab)
 
             # Find byte pairs affected by the comming merge
-            #affected_pairs = CountDict()
             edit_keys = []
             for key, count in self.counts.items():
                 found = _contains(key, max_pair)
@@ -257,22 +275,22 @@ class Tokenizer:
             byte_pairs = byte_pairs.sort()
 
             # Add to merge list
-            merges.append((vocab[max_pair[0]], vocab[max_pair[1]]))
+            merges.append((self.vocab[max_pair[0]], self.vocab[max_pair[1]]))
             # Update vocabulary
-            vocab[len(vocab)] = vocab[max_pair[0]] + vocab[max_pair[1]]
-        return vocab, merges
+            self.vocab[len(self.vocab)] = self.vocab[max_pair[0]] + self.vocab[max_pair[1]]
+        return merges
 
     def train(self, input_path: str, vocab_size: int):
-
         # Pre-tokenize
         st_time = time()
         self.pretokenize(Path(input_path), self.num_processes)
         print(f"Pretokenization done, time: {time() - st_time}")
 
         # Init vocabulary
-        vocab = {}
-        for i in range(256):
-            vocab[i] = bytes([i])
+        vocab = {i: bytes([i]) for i in range(256)}
+        for spt in self.special_tokens:
+            vocab[len(vocab)] = bytes(spt, encoding='utf-8')
+        self.vocab = vocab
 
         # Init byte pairs
         byte_pairs = CountDict()
@@ -281,18 +299,12 @@ class Tokenizer:
                 byte_pairs.update({(b1, b2): count})
         byte_pairs = byte_pairs.sort()
 
-        vocab, merges = self._train_loop(
+        merges = self._train_loop(
             byte_pairs,
-            vocab,
             num_merges=max(vocab_size - 256 - len(self.special_tokens), 0)
         )
-        i = len(vocab)
-        for spt in self.special_tokens:
-            vocab[i] = bytes(spt, encoding='utf-8')
-            i += 1
 
-        self.vocab = vocab
-        self._vocab_list = list(vocab.values())
+        self._vocab_list = list(self.vocab.values())
         self.merges = merges
     
     def _tokenize(self, pre_token: list[bytes]) -> list[bytes]:
@@ -302,48 +314,53 @@ class Tokenizer:
         for merge in self.merges:
             if merge not in possible_merges:
                 continue
-            ind = possible_merges.index(merge)
-            pre_token[ind] += pre_token[ind + 1]
-            del pre_token[ind + 1]
-            if len(pre_token) <= 1:
-                return pre_token
+            inds = [ind for ind, mrg in enumerate(possible_merges) if mrg == merge]
+            for ind in sorted(inds, reverse=True):
+                pre_token[ind] += pre_token[ind + 1]
+                del pre_token[ind + 1]
+                if len(pre_token) <= 1:
+                    return pre_token
             possible_merges = [(pre_token[i], pre_token[i + 1]) for i in range(len(pre_token) - 1)]
         return pre_token
 
     def encode(self, text: str) -> list[int]:
         """Encode an input text into a sequence of token IDs."""
-        pre_tks = self._pretokenize_chunk(text)
+        scanners = self._pretokenize_chunk(text)
         out_list = []
-        for b_tokens in pre_tks:
+        for scr in scanners:
             # Convert from int to bytes
-            tokens = self._tokenize([bytes([byte]) for byte in b_tokens])
-            out_list += [self._vocab_list.index(tk) for tk in tokens] # ValueError if not preset!
+            if isinstance(scr, str):
+                out_list.append(self._vocab_list.index(bytes(scr, encoding='utf-8')))
+            else:
+                for match in scr:
+                    tokens = self._tokenize([bytes([c]) for c in match.group().encode("utf-8")])
+                    out_list += [self._vocab_list.index(tk) for tk in tokens] # ValueError if not present!
         return out_list
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         """Given an iterable of strings (e.g., a Python file handle), return a generator
         that lazily yields token IDs. This is required for memory-efficient tokenization
         of large files that we cannot directly load into memory."""
-        pass
+        for text in iterable:
+            yield from self.encode(text)
 
     def decode(self, ids: list[int]) -> str:
         """Decode a sequence of token IDs into text."""
         bts =  b"".join([self.vocab[t_id] for t_id in ids])
-        return bts.decode()
+        return bts.decode(errors='replace')
 
 if __name__=='__main__':
     base_dir = Path.cwd()
     path = base_dir / "data" / "TinyStoriesV2-GPT4-train.txt"
-    # tk = Tokenizer(num_processes=4, special_tokens=["<|endoftext|>"])
+    tk = Tokenizer(num_processes=8, special_tokens=["<|endoftext|>"])
 
     # tk.train(path, 10000)
     # with open('tinystories_vocab.pkl', 'wb') as f:
     #     pickle.dump(tk.vocab, f)
     # with open('tinystories_merges.pkl', 'wb') as f:
     #     pickle.dump(tk.merges, f)
-    # import pdb; pdb.set_trace()
     tk = Tokenizer.from_files('tinystories_vocab.pkl', 'tinystories_merges.pkl',
                               special_tokens=["<|endoftext|>"])
-    enc = tk.encode("encode this sentence plz")
+    enc = tk.encode("encode this sentence <|endoftext|> plz")
     print(tk.decode(enc))
     import pdb; pdb.set_trace()
