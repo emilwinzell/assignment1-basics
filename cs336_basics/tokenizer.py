@@ -7,6 +7,27 @@ from time import time
 from line_profiler import profile
 import pickle
 from tqdm import tqdm
+import datasets
+from collections import defaultdict
+
+
+class KeyWrapper:
+    def __init__(self, values):
+        self.values = list(values)  # mutable
+
+    def __hash__(self):
+        # Still hashable! Cast to tuple for hashing
+        return hash(tuple(self.values))
+
+    def __eq__(self, other):
+        return isinstance(other, KeyWrapper) and self.values == other.values
+
+    def __repr__(self):
+        return f"KeyWrapper({self.values})"
+    
+    def update(self, values):
+        self.values = list(values)
+
 
 class CountDict(dict):
 
@@ -17,7 +38,7 @@ class CountDict(dict):
 
     def update(self, *args, **kwargs):
         """Updates the dictonary, adds to all values of excisting keys."""
-        temp = dict(*args, **kwargs)
+        temp = dict(*args, **kwargs) if kwargs else args[0]
         self._update_counts(temp)
 
     def _update_counts(self, mapping: dict):
@@ -136,7 +157,8 @@ class Tokenizer:
             chunk = in_queue.get()
             if chunk is None:
                 return
-            chunk = chunk.decode("utf-8", errors="ignore")
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8", errors="ignore")
             counts = self._count_pretokens(self._pretokenize_chunk(chunk))
             out_list.append(counts)
     
@@ -148,6 +170,36 @@ class Tokenizer:
             for match in ptk:
                 counts.update({tuple(bytes(match.group(), encoding="utf-8")): 1})
         return counts
+    
+    def pretokenize_from_ds(self, ds, num_processes=4):
+        counts = CountDict()
+        manager = mp.Manager()
+        out_list = manager.list()
+        in_queue = manager.Queue()
+
+        pool = []
+        for _ in range(num_processes):
+            p = mp.Process(target=self._pretokenize_parallell, args=(in_queue, out_list))
+            p.start()
+            pool.append(p)
+
+        for sample in ds:
+            text = sample.get('text', '')
+            if text:
+                in_queue.put(text)
+
+        # Put None to end process
+        for _ in range(num_processes):
+            in_queue.put(None)
+
+        for p in pool:
+            p.join()
+
+        for res in out_list:
+            counts.update(res)
+
+        self.counts.update(counts)
+        self.counts = self.counts.sort()
 
     def pretokenize(self, file: Path, num_processes: int = 4):
         """Read file and store token counts.
@@ -203,7 +255,7 @@ class Tokenizer:
             return []
         return [(x1, x2) for x1, x2 in zip(sequence[:-1], sequence[1:])]
 
-    def _train_loop(self, byte_pairs: CountDict, num_merges: int):
+    def _train_loop(self, byte_pairs: CountDict, pair_index: defaultdict[tuple, list[KeyWrapper]], num_merges: int):
 
         def _contains(target: tuple[int], check: tuple[int]):
             return [
@@ -211,7 +263,7 @@ class Tokenizer:
                 if target[ind] == check[0] and target[ind + 1] == check[1]
             ]
 
-        def _update_key(old_key: tuple[int], replace_val: int, replace_at: list[int]):
+        def _update_key(old_key: tuple[int], replace_val: int, replace_at: list[int]) -> tuple:
             ind = 0
             new_key = []
             while ind < len(old_key):
@@ -224,13 +276,16 @@ class Tokenizer:
             return tuple(new_key)
 
         def _count_byte_pair_change(new_key, old_key):
-            new_byte_pairs = CountDict()
-            for pair in self._adj_pairs(new_key):
-                new_byte_pairs.update({pair: 1})
-            old_byte_pairs = CountDict()
-            for pair in self._adj_pairs(old_key):
-                old_byte_pairs.update({pair: 1})
-            return new_byte_pairs - old_byte_pairs
+            diff = defaultdict(int)
+            # Subtract counts from old_key
+            for i in range(len(old_key) - 1):
+                pair = (old_key[i], old_key[i+1])
+                diff[pair] -= 1
+            # Add counts from new_key
+            for i in range(len(new_key) - 1):
+                pair = (new_key[i], new_key[i+1])
+                diff[pair] += 1
+            return diff
 
         merges = []
         for iter in tqdm(range(num_merges)):
@@ -238,12 +293,12 @@ class Tokenizer:
             max_val = -1
             max_byte_pairs = {}
             for key, value in byte_pairs.items():
-                if max_val == -1:
+                if value > max_val:
+                    max_byte_pairs = {(self.vocab[key[0]], self.vocab[key[1]]): key}
                     max_val = value
-                if value >= max_val:
+                elif value == max_val:
                     max_byte_pairs[(self.vocab[key[0]], self.vocab[key[1]])] = key
-                else:
-                    break
+
             max_pair = max_byte_pairs[max(max_byte_pairs)]
 
             # Next free position in vocabulary, this will be the encoding value
@@ -252,39 +307,48 @@ class Tokenizer:
 
             # Find byte pairs affected by the comming merge
             edit_keys = []
-            for key, count in self.counts.items():
-                found = _contains(key, max_pair)
-                if found:
-                    new_key = _update_key(key, tk_ind, found)
-                    edit_keys.append((key, new_key))
-                    # Update counts in byte pairs
-                    btp_change = _count_byte_pair_change(new_key, key)
-                    for btp, change in btp_change.items():
-                        byte_pairs[btp] = byte_pairs.get(btp, 0) + change * count
-                        if byte_pairs[btp] == 0:
-                            # Remove byte pair
-                            del byte_pairs[btp]
-                        elif byte_pairs[btp] < 0:
-                            raise ValueError("Something has gone terribly wrong...")                            
+            for key_obj in pair_index.pop(max_pair, KeyWrapper([])):
+                key = tuple(key_obj.values)
 
+                found = _contains(key, max_pair)
+                if not found:
+                    continue
+
+                count = self.counts[key]
+                # Get new key
+                new_key = _update_key(key, tk_ind, found)
+                edit_keys.append((key, new_key))
+
+                # Update keys in fast lookup index
+                key_obj.update(new_key)
+                # Update counts in byte pairs and add new pairs to lookup
+                btp_change = _count_byte_pair_change(new_key, key)
+                for btp, change in btp_change.items():
+                    byte_pairs[btp] = byte_pairs.get(btp, 0) + change * count
+                    if byte_pairs[btp] == 0:
+                        # Remove byte pair
+                        del byte_pairs[btp]
+                    elif byte_pairs[btp] < 0:
+                        raise ValueError("Something has gone terribly wrong...")   
+                    if change > 0:
+                        pair_index[btp].append(key_obj)
+            
             # Update pretoken counts
             for (old_key, new_key) in edit_keys:
                 self.counts[new_key] = self.counts.pop(old_key)
-
-            # Re-sort byte pairs
-            byte_pairs = byte_pairs.sort()
-
             # Add to merge list
             merges.append((self.vocab[max_pair[0]], self.vocab[max_pair[1]]))
             # Update vocabulary
             self.vocab[len(self.vocab)] = self.vocab[max_pair[0]] + self.vocab[max_pair[1]]
+
         return merges
 
     def train(self, input_path: str, vocab_size: int):
         # Pre-tokenize
-        st_time = time()
-        self.pretokenize(Path(input_path), self.num_processes)
-        print(f"Pretokenization done, time: {time() - st_time}")
+        if len(self.counts) == 0:
+            st_time = time()
+            self.pretokenize(Path(input_path), self.num_processes)
+            print(f"Pretokenization done, time: {time() - st_time}")
 
         # Init vocabulary
         vocab = {i: bytes([i]) for i in range(256)}
@@ -292,15 +356,17 @@ class Tokenizer:
             vocab[len(vocab)] = bytes(spt, encoding='utf-8')
         self.vocab = vocab
 
-        # Init byte pairs
+        # Init byte pairs and fast lookup:
+        pair_index = defaultdict(list)
         byte_pairs = CountDict()
         for tk_bytes, count in self.counts.items():
+            pi_key = KeyWrapper(tk_bytes)
             for b1, b2 in zip(tk_bytes[:-1], tk_bytes[1:]):
                 byte_pairs.update({(b1, b2): count})
-        byte_pairs = byte_pairs.sort()
+                pair_index[(b1, b2)].append(pi_key)
 
         merges = self._train_loop(
-            byte_pairs,
+            byte_pairs, pair_index,
             num_merges=max(vocab_size - 256 - len(self.special_tokens), 0)
         )
 
@@ -352,15 +418,16 @@ class Tokenizer:
 if __name__=='__main__':
     base_dir = Path.cwd()
     path = base_dir / "data" / "TinyStoriesV2-GPT4-train.txt"
-    tk = Tokenizer(num_processes=8, special_tokens=["<|endoftext|>"])
-
-    # tk.train(path, 10000)
-    # with open('tinystories_vocab.pkl', 'wb') as f:
-    #     pickle.dump(tk.vocab, f)
-    # with open('tinystories_merges.pkl', 'wb') as f:
-    #     pickle.dump(tk.merges, f)
-    tk = Tokenizer.from_files('tinystories_vocab.pkl', 'tinystories_merges.pkl',
-                              special_tokens=["<|endoftext|>"])
+    tk = Tokenizer(num_processes=30, special_tokens=["<|endoftext|>"])
+    ds = datasets.load_dataset("stanford-cs336/owt-sample", split="train")
+    tk.pretokenize_from_ds(ds, 30)
+    tk.train("", 32000)
+    with open('owt_vocab.pkl', 'wb') as f:
+        pickle.dump(tk.vocab, f)
+    with open('owt_merges.pkl', 'wb') as f:
+        pickle.dump(tk.merges, f)
+    # tk = Tokenizer.from_files('tinystories_vocab.pkl', 'tinystories_merges.pkl',
+    #                           special_tokens=["<|endoftext|>"])
     enc = tk.encode("encode this sentence <|endoftext|> plz")
     print(tk.decode(enc))
     import pdb; pdb.set_trace()
