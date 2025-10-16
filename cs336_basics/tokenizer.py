@@ -9,6 +9,7 @@ import pickle
 from tqdm import tqdm
 import datasets
 from collections import defaultdict
+import numpy as np
 
 
 class KeyWrapper:
@@ -67,6 +68,7 @@ class Tokenizer:
         self.vocab = vocab if vocab else {}
         self._vocab_list = list(self.vocab.values())
         self.merges = merges if merges else []
+        self._merge_lookup = {merge: ind for ind, merge in enumerate(self.merges)}
         self.windows_platform = True if os.name == 'nt' else False
 
     @classmethod
@@ -372,21 +374,62 @@ class Tokenizer:
 
         self._vocab_list = list(self.vocab.values())
         self.merges = merges
-    
+        self._merge_lookup = {merge: ind for ind, merge in enumerate(self.merges)}
+
+    def _get_possible_merges(self, pre_token: list[bytes]):
+        possible_merges = {}
+        for i in range(len(pre_token) - 1):
+            merge = (pre_token[i], pre_token[i + 1])
+            if merge in possible_merges:
+                continue
+            try:
+                idx = self._merge_lookup[merge]
+            except KeyError:
+                continue
+            possible_merges[merge] = idx
+        return possible_merges
+
     def _tokenize(self, pre_token: list[bytes]) -> list[bytes]:
+
         if len(pre_token) <= 1:
             return pre_token
-        possible_merges = [(pre_token[i], pre_token[i + 1]) for i in range(len(pre_token) - 1)]
-        for merge in self.merges:
-            if merge not in possible_merges:
-                continue
-            inds = [ind for ind, mrg in enumerate(possible_merges) if mrg == merge]
-            for ind in sorted(inds, reverse=True):
-                pre_token[ind] += pre_token[ind + 1]
-                del pre_token[ind + 1]
-                if len(pre_token) <= 1:
+
+        possible_merges = self._get_possible_merges(pre_token)
+        while possible_merges:
+            merge_idx = min(possible_merges.values())
+            merge = self.merges[merge_idx]
+
+            for ind in range(len(pre_token) - 1):
+                if ind + 1 >= len(pre_token):
+                    break  # End of list reached
+
+                # Apply merge everywhere
+                if merge == (pre_token[ind], pre_token[ind + 1]):
+                    pre_token[ind] += pre_token[ind + 1]
+                    del pre_token[ind + 1]
+
+                    # Add new merge
+                    if ind != 0:
+                        new_merge = (pre_token[ind - 1], pre_token[ind])
+                        if new_merge not in possible_merges:
+                            try:
+                                possible_merges[new_merge] = self._merge_lookup[new_merge]
+                            except KeyError:
+                                pass
+                    if ind + 1 < len(pre_token):
+                        new_merge = (pre_token[ind], pre_token[ind + 1])
+                        if new_merge not in possible_merges:
+                            try:
+                                possible_merges[new_merge] = self._merge_lookup[new_merge]
+                            except KeyError:
+                                pass
+
+            # Delete old merge
+            del possible_merges[merge]
+
+            if len(pre_token) <= 1:
                     return pre_token
-            possible_merges = [(pre_token[i], pre_token[i + 1]) for i in range(len(pre_token) - 1)]
+
         return pre_token
 
     def encode(self, text: str) -> list[int]:
@@ -415,19 +458,76 @@ class Tokenizer:
         bts =  b"".join([self.vocab[t_id] for t_id in ids])
         return bts.decode(errors='replace')
 
+
+def calculate_compression_ratio(tokenizer: Tokenizer, documents: list[str]):
+    """Calculate the tokenizers compression ratio in bytes/token"""
+    comp_ratios = []
+    for doc in documents:
+        num_bytes = len(bytes(doc, encoding='utf-8'))
+        enc = tokenizer.encode(doc)
+        comp_ratios.append(num_bytes / len(enc))
+
+    return sum(comp_ratios) / len(comp_ratios)
+
+
+def est_throughput(tokenizer: Tokenizer, documents: list[str]):
+    tot_time = 0     
+    tot_bytes = 0
+    for doc in documents:               
+        st_time = time()
+        tokenizer.encode(doc)
+        tot_time += time() - st_time
+        tot_bytes += len(bytes(doc, encoding='utf-8'))
+    return tot_bytes / tot_time
+
+
+def encode_from_file(path: Path, tokenizer: Tokenizer):
+    token_ids = []
+    with open(path, encoding="utf-8") as f:
+        for ids in tqdm(tokenizer.encode_iterable(f)):
+            token_ids += ids
+    return np.array(token_ids, dtype=np.uint16)
+
+
+def encode_from_ds(ds: datasets.Dataset, tokenizer: Tokenizer):
+    token_ids = []
+    for sample in tqdm(ds):
+        text = sample.get('text', '')
+        if text:
+            token_ids += tokenizer.encode(text)
+    return np.array(token_ids, dtype=np.uint16)
+
+
 if __name__=='__main__':
     base_dir = Path.cwd()
-    path = base_dir / "data" / "TinyStoriesV2-GPT4-train.txt"
-    tk = Tokenizer(num_processes=30, special_tokens=["<|endoftext|>"])
-    ds = datasets.load_dataset("stanford-cs336/owt-sample", split="train")
-    tk.pretokenize_from_ds(ds, 30)
-    tk.train("", 32000)
-    with open('owt_vocab.pkl', 'wb') as f:
-        pickle.dump(tk.vocab, f)
-    with open('owt_merges.pkl', 'wb') as f:
-        pickle.dump(tk.merges, f)
-    # tk = Tokenizer.from_files('tinystories_vocab.pkl', 'tinystories_merges.pkl',
-    #                           special_tokens=["<|endoftext|>"])
-    enc = tk.encode("encode this sentence <|endoftext|> plz")
-    print(tk.decode(enc))
-    import pdb; pdb.set_trace()
+    owt_ds = datasets.load_dataset("stanford-cs336/owt-sample", split='validation')
+    
+    with open(base_dir / "data" / "TinyStoriesV2-GPT4-valid.txt", encoding="utf-8") as f:
+        chunk = f.read()
+        tinystories = chunk.split("<|endoftext|>")
+
+    tk_tiny = Tokenizer.from_files(
+        vocab_filepath=base_dir / 'data' / 'tinystories_vocab.pkl',
+        merges_filepath=base_dir / 'data' / 'tinystories_merges.pkl',
+        special_tokens=["<|endoftext|>"]
+    )
+
+    tk_owt = Tokenizer.from_files(
+        vocab_filepath=base_dir / 'data' / 'owt_vocab.pkl',
+        merges_filepath=base_dir / 'data' / 'owt_merges.pkl',
+        special_tokens=["<|endoftext|>"]
+    )
+
+    owt_subset = []
+    for sample in owt_ds:
+        text = sample.get('text', '')
+        if text:
+            owt_subset.append(text)
+
+    tiny_subset = [text for text in tinystories if text]
+
+    owt_cr = calculate_compression_ratio(tk_owt, owt_subset[:10])
+    tiny_cr = calculate_compression_ratio(tk_tiny, tiny_subset[:10])
+
+    thp = est_throughput(tk_owt, owt_subset[:1000])
+    print(thp)
