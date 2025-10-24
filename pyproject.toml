@@ -19,6 +19,8 @@ dependencies = [
     "tqdm>=4.67.1",
     "wandb>=0.19.7",
     "ty>=0.0.1a16",
+    "line-profiler>=5.0.0",
+    "datasets>=4.2.0",
 ]
 
 [build-system]
@@ -46,7 +48,19 @@ line-length = 120
 "__init__.py" = ["E402", "F401", "F403", "E501"]
 
 [tool.ruff.lint]
-extend-select = ["UP"]
+preview = true
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # Pyflakes
+    "B",  # bugbear
+    "COM",  # Trailing commas
+    "UP", # pyupgrade
+    # "SIM", # flake8-simplify
+    "SLOT", # Define __slots__ in str/tuple subclasses
+    "RUF100", # Unused noqa directive
+]
 ignore = [
+    "COM812",  # Trailing comma missing
     "F722"
 ]

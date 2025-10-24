@@ -25,7 +25,7 @@ class KeyWrapper:
 
     def __repr__(self):
         return f"KeyWrapper({self.values})"
-    
+
     def update(self, values):
         self.values = list(values)
 
@@ -50,12 +50,13 @@ class CountDict(dict):
 
     def sort(self):
         return self.__class__(sorted(self.items(), key=lambda item: item[1], reverse=True))
-    
+
     def __sub__(self, other):
         res = {}
         for key in set(list(self.keys()) + list(other.keys())):
             res[key] = self.get(key, 0) - other.get(key, 0)
         return self.__class__(res)
+
 
 class Tokenizer:
 
@@ -128,10 +129,10 @@ class Tokenizer:
 
         # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
         return sorted(set(chunk_boundaries))
-    
+
     def _pretokenize_chunk(self, chunk: str) -> list[re.Scanner | str]:
         """Splits text chunks into suitable pre-tokens
-        
+
         Returns
         -------
         list
@@ -153,7 +154,7 @@ class Tokenizer:
             ) if subch not in self.special_tokens else subch
             words.append(tk_iter)
         return words
-    
+
     def _pretokenize_parallell(self, in_queue, out_list):
         while True:
             chunk = in_queue.get()
@@ -163,7 +164,7 @@ class Tokenizer:
                 chunk = chunk.decode("utf-8", errors="ignore")
             counts = self._count_pretokens(self._pretokenize_chunk(chunk))
             out_list.append(counts)
-    
+
     def _count_pretokens(self, ptks: list[re.Scanner]) -> CountDict:
         counts = CountDict()
         for ptk in ptks:
@@ -172,7 +173,7 @@ class Tokenizer:
             for match in ptk:
                 counts.update({tuple(bytes(match.group(), encoding="utf-8")): 1})
         return counts
-    
+
     def pretokenize_from_ds(self, ds, num_processes=4):
         counts = CountDict()
         manager = mp.Manager()
@@ -233,8 +234,8 @@ class Tokenizer:
 
             with open(file, "rb") as f:
                 boundaries = self._find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-                
-                for start, end in zip(boundaries[:-1], boundaries[1:]):
+
+                for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
                     f.seek(start)
                     chunk = f.read(end - start)
                     in_queue.put(chunk)
@@ -255,9 +256,10 @@ class Tokenizer:
     def _adj_pairs(self, sequence):
         if len(sequence) <= 1:
             return []
-        return [(x1, x2) for x1, x2 in zip(sequence[:-1], sequence[1:])]
+        return [(x1, x2) for x1, x2 in zip(sequence[:-1], sequence[1:], strict=True)]
 
-    def _train_loop(self, byte_pairs: CountDict, pair_index: defaultdict[tuple, list[KeyWrapper]], num_merges: int):
+    def _train_loop(self, byte_pairs: CountDict, pair_index: defaultdict[tuple, list[KeyWrapper]],
+                    num_merges: int):
 
         def _contains(target: tuple[int], check: tuple[int]):
             return [
@@ -281,11 +283,11 @@ class Tokenizer:
             diff = defaultdict(int)
             # Subtract counts from old_key
             for i in range(len(old_key) - 1):
-                pair = (old_key[i], old_key[i+1])
+                pair = (old_key[i], old_key[i + 1])
                 diff[pair] -= 1
             # Add counts from new_key
             for i in range(len(new_key) - 1):
-                pair = (new_key[i], new_key[i+1])
+                pair = (new_key[i], new_key[i + 1])
                 diff[pair] += 1
             return diff
 
@@ -331,10 +333,10 @@ class Tokenizer:
                         # Remove byte pair
                         del byte_pairs[btp]
                     elif byte_pairs[btp] < 0:
-                        raise ValueError("Something has gone terribly wrong...")   
+                        raise ValueError("Something has gone terribly wrong...")
                     if change > 0:
                         pair_index[btp].append(key_obj)
-            
+
             # Update pretoken counts
             for (old_key, new_key) in edit_keys:
                 self.counts[new_key] = self.counts.pop(old_key)
@@ -363,7 +365,7 @@ class Tokenizer:
         byte_pairs = CountDict()
         for tk_bytes, count in self.counts.items():
             pi_key = KeyWrapper(tk_bytes)
-            for b1, b2 in zip(tk_bytes[:-1], tk_bytes[1:]):
+            for b1, b2 in zip(tk_bytes[:-1], tk_bytes[1:], strict=True):
                 byte_pairs.update({(b1, b2): count})
                 pair_index[(b1, b2)].append(pi_key)
 
@@ -428,7 +430,7 @@ class Tokenizer:
             del possible_merges[merge]
 
             if len(pre_token) <= 1:
-                    return pre_token
+                return pre_token
 
         return pre_token
 
@@ -443,7 +445,7 @@ class Tokenizer:
             else:
                 for match in scr:
                     tokens = self._tokenize([bytes([c]) for c in match.group().encode("utf-8")])
-                    out_list += [self._vocab_list.index(tk) for tk in tokens] # ValueError if not present!
+                    out_list += [self._vocab_list.index(tk) for tk in tokens]
         return out_list
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
@@ -455,7 +457,7 @@ class Tokenizer:
 
     def decode(self, ids: list[int]) -> str:
         """Decode a sequence of token IDs into text."""
-        bts =  b"".join([self.vocab[t_id] for t_id in ids])
+        bts = b"".join([self.vocab[t_id] for t_id in ids])
         return bts.decode(errors='replace')
 
 
@@ -471,9 +473,9 @@ def calculate_compression_ratio(tokenizer: Tokenizer, documents: list[str]):
 
 
 def est_throughput(tokenizer: Tokenizer, documents: list[str]):
-    tot_time = 0     
+    tot_time = 0
     tot_bytes = 0
-    for doc in documents:               
+    for doc in documents:
         st_time = time()
         tokenizer.encode(doc)
         tot_time += time() - st_time
@@ -485,7 +487,7 @@ def encode_from_file(path: Path, tokenizer: Tokenizer):
     token_ids = []
     with open(path, encoding="utf-8") as f:
         for ids in tqdm(tokenizer.encode_iterable(f)):
-            token_ids += ids
+            token_ids.append(ids)
     return np.array(token_ids, dtype=np.uint16)
 
 
@@ -498,10 +500,10 @@ def encode_from_ds(ds: datasets.Dataset, tokenizer: Tokenizer):
     return np.array(token_ids, dtype=np.uint16)
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     base_dir = Path.cwd()
     owt_ds = datasets.load_dataset("stanford-cs336/owt-sample", split='validation')
-    
+
     with open(base_dir / "data" / "TinyStoriesV2-GPT4-valid.txt", encoding="utf-8") as f:
         chunk = f.read()
         tinystories = chunk.split("<|endoftext|>")
