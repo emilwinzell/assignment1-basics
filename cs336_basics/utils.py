@@ -21,7 +21,7 @@ def softmax(x: torch.Tensor, i: int) -> torch.Tensor:
 
 
 def scaled_dot_product_attention(queries: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
-                                 mask: torch.Tensor = None):
+                                 mask: torch.Tensor = None) -> torch.Tensor:
     """Scaled dot product attention.
 
     Parameters

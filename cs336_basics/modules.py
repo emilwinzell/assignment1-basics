@@ -28,13 +28,14 @@ class Linear(Module):
         self._init_params()
 
     def _init_params(self):
-        w = torch.empty(size=(self.out_features, self.in_features), **self.kwargs)
-        init.trunc_normal_(w, mean=0.0, std=np.sqrt(2 / (self.in_features + self.out_features)))
-        self.W = Parameter(w)
+        weight = torch.empty(size=(self.out_features, self.in_features), **self.kwargs)
+        std = np.sqrt(2 / (self.in_features + self.out_features))
+        init.trunc_normal_(weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
+        self.weight = Parameter(weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the linear transformation to the input."""
-        return einsum(self.W, x, "n m, ... m -> ... n")
+        return einsum(self.weight, x, "n m, ... m -> ... n")
 
 
 class Embedding(Module):
@@ -61,14 +62,13 @@ class Embedding(Module):
         self._init_params()
 
     def _init_params(self):
-        w = torch.empty(size=(self.num_embeddings, self.embedding_dim), **self.kwargs)
-        init.trunc_normal_(w, mean=0.0,
-                           std=np.sqrt(2 / (self.num_embeddings + self.embedding_dim)))
-        self.W = Parameter(w)
+        weight = torch.empty(size=(self.num_embeddings, self.embedding_dim), **self.kwargs)
+        init.trunc_normal_(weight, mean=0.0, std=1, a=-3, b=3)
+        self.weight = Parameter(weight)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Lookup the embedding vectors for the given token IDs."""
-        return self.W[token_ids, :]
+        return self.weight[token_ids, :]
 
 
 class RMSNorm(Module):
@@ -90,9 +90,8 @@ class RMSNorm(Module):
         self._init_params()
 
     def _init_params(self):
-        w = torch.empty(size=(self.d_model,), **self.kwargs)
-        init.trunc_normal_(w, mean=0.0, std=np.sqrt(1 / self.d_model))
-        self.W = Parameter(w)
+        weight = torch.ones(size=(self.d_model,), **self.kwargs)
+        self.weight = Parameter(weight)
 
     def _rms(self, x: torch.Tensor):
         a_sq = einsum(x, x, "... d_model, ... d_model -> ...")
@@ -105,7 +104,7 @@ class RMSNorm(Module):
         in_dtype = x.dtype
         x = x.to(torch.float32)
         rms = self._rms(x)
-        result = einsum(self.W, x, "d_model, ... d_model -> ... d_model")
+        result = einsum(self.weight, x, "d_model, ... d_model -> ... d_model")
         result = einsum(1 / rms, result, "..., ... d_model -> ... d_model")
         return result.to(in_dtype)
 
@@ -145,29 +144,22 @@ class SwiGLU(Module):
         self._init_params()
 
     def _init_params(self):
-        w1 = torch.empty(size=(self.d_ff, self.d_model), **self.kwargs)
-        w2 = torch.empty(size=(self.d_model, self.d_ff), **self.kwargs)
-        w3 = torch.empty(size=(self.d_ff, self.d_model), **self.kwargs)
-
-        self.W1 = Parameter(
-            init.trunc_normal_(w1, mean=0.0, std=np.sqrt(2 / (self.d_ff + self.d_model)))
-        )
-        self.W3 = Parameter(
-            init.trunc_normal_(w3, mean=0.0, std=np.sqrt(2 / (self.d_ff + self.d_model)))
-        )
-        self.W2 = Parameter(
-            init.trunc_normal_(w2, mean=0.0, std=np.sqrt(2 / (self.d_ff + self.d_model)))
-        )
+        self.w1 = Linear(in_features=self.d_model, out_features=self.d_ff, **self.kwargs)
+        self.w2 = Linear(in_features=self.d_ff, out_features=self.d_model, **self.kwargs)
+        self.w3 = Linear(in_features=self.d_model, out_features=self.d_ff, **self.kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # SiLU
-        out = self.silu.forward(einsum(self.W1, x, "d_ff d_model, ... d_model -> ... d_ff"))
+        out = self.silu.forward(self.w1.forward(x))
         # GLU
-        out = out * einsum(self.W3, x, "d_ff d_model, ... d_model -> ... d_ff")
-        return einsum(self.W2, out, "d_model d_ff, ... d_ff -> ... d_model")
+        out = out * self.w3.forward(x)
+        return self.w2.forward(out)
 
 
 class RotaryPositionalEmbedding(Module):
+    theta: float
+    d_k: int
+    max_seq_len: int
 
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
         """Construct the RoPE module and create buffers if needed.
@@ -209,6 +201,18 @@ class RotaryPositionalEmbedding(Module):
 
         self.register_buffer("rope_buffer", r_buff, persistent=False)
 
+    def set_max_seq_len(self, max_seq_len: int):
+        if max_seq_len != self.max_seq_len:
+            self.max_seq_len = max_seq_len
+            self._init_params()
+
+    def set_d_k(self, d_k: int):
+        if d_k != self.d_k:
+            if d_k % 2 != 0:
+                raise ValueError("The dimension has to be divisible by 2")
+            self.d_k = d_k
+            self._init_params()
+
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         """Process an input tensor of shape (..., seq_len, d_k) and return a tensor of the same
         shape.
@@ -221,10 +225,10 @@ class RotaryPositionalEmbedding(Module):
 
         'tests/_snapshots/test_rope.npz'
         """
+        batch_tp = torch.squeeze(token_positions)
         # Repeat token positions over batches if necessary
-        if len(x.shape) > len(token_positions.shape) + 1:
+        if len(x.shape) > len(batch_tp.shape) + 1:
             batch_sizes = x.shape[:-2]
-            batch_tp = token_positions
             for bs in batch_sizes:
                 batch_tp = repeat(batch_tp, '... seq_len -> ... c seq_len', c=bs)
 
