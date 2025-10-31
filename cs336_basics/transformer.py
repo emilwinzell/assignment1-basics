@@ -147,9 +147,8 @@ class TransformerLM(Module):
         super().__init__()
         self.num_layers = num_layers
         self.kwargs = {"device": device, "dtype": dtype}
-
         self.token_embeddings = Embedding(num_embeddings=vocab_size,
-                                          embedding_dim=context_length * num_heads,
+                                          embedding_dim=d_model,
                                           **self.kwargs)
         self.layers = _TransformerLayers(num_layers, d_model, num_heads, d_ff, **self.kwargs,
                                          rope=rope)
