@@ -48,3 +48,18 @@ def scaled_dot_product_attention(queries: torch.Tensor, keys: torch.Tensor, valu
 
     out = softmax(out, -1)
     return einsum(out, values, "b ... i s, b ... s d_v -> b ... i d_v")
+
+
+def cross_entropy_loss(preds: torch.Tensor, targets: torch.Tensor):
+    """
+    predicted logits (oi) and targets (xi+1) and computes the cross entropy ℓi = − log softmax(oi)[xi+1]
+
+    preds = (batch_size ..., vocab_size), targets = (batch_size ...)
+    -ln (softmax(oi)) = ln(sum(exp(o))) - oi
+    """
+    out = preds - preds.max(dim=-1, keepdim=True)[0]
+    one_hot = torch.eye(out.shape[-1])[targets]  # One hot encode targets to retrieve logits with einsum
+    batch_loss = torch.log(torch.sum(out.exp(), dim=-1)) - einsum(out, one_hot, "... vs, ... vs -> ...")
+    if batch_loss.dim() == 1:
+        batch_loss = torch.unsqueeze(batch_loss, 0)  # Add a dimension to take mean over
+    return batch_loss.flatten(1).mean(1)  # Mean over all except first batch dimension
