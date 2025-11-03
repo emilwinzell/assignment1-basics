@@ -63,3 +63,57 @@ def cross_entropy_loss(preds: torch.Tensor, targets: torch.Tensor):
     if batch_loss.dim() == 1:
         batch_loss = torch.unsqueeze(batch_loss, 0)  # Add a dimension to take mean over
     return batch_loss.flatten(1).mean(1)  # Mean over all except first batch dimension
+
+
+def learning_rate_schedule(t: int, lr_max: float, lr_min: float, warm_up: int,
+                           annealing: int) -> float:
+    """Cosine annealing learning rate schedule
+
+    Parameters
+    ----------
+    t : int
+        Iteration
+    lr_max : float
+        Learning rate max
+    lr_min : float
+        Learning rate min
+    warm_up : int
+        Number of warm up iterations, at which t should warm-up stop.
+    annealing : int
+        Number of annealing iterations, at which t should annealing stop.
+
+    Returns
+    -------
+    float
+        Learning rate at step t
+    """
+    if annealing <= warm_up:
+        raise ValueError("The number of annealing iterations must be greater than warm_up")
+    if t < warm_up:
+        # Warm up phase
+        return t / warm_up * lr_max
+    elif t > annealing:
+        # Post annealing phase
+        return lr_min
+    else:
+        w = np.pi * (t - warm_up) / (annealing - warm_up)
+        return lr_min + 0.5 * (1 + np.cos(w)) * (lr_max - lr_min)
+
+
+def gradient_clipping(params: list[torch.nn.Parameter], max_norm: float, eps: float = 1e-6):
+    all_norms = []
+    for param in params:
+        if param.grad is None:
+            continue
+        grad = param.grad.data
+        grad_l2 = torch.linalg.norm(grad, ord=2)
+        all_norms.append(grad_l2)
+
+    total_norm = torch.linalg.norm(torch.stack(all_norms), ord=2)
+    if total_norm < max_norm:
+        return
+
+    for param in params:
+        if param.grad is None:
+            continue
+        param.grad.data = grad.mul(max_norm / (total_norm + eps))
