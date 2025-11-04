@@ -1,3 +1,5 @@
+import os
+import typing
 import torch
 import numpy as np
 from einops import einsum
@@ -50,7 +52,7 @@ def scaled_dot_product_attention(queries: torch.Tensor, keys: torch.Tensor, valu
     return einsum(out, values, "b ... i s, b ... s d_v -> b ... i d_v")
 
 
-def cross_entropy_loss(preds: torch.Tensor, targets: torch.Tensor):
+def cross_entropy_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
     predicted logits (oi) and targets (xi+1) and computes the cross entropy ℓi = − log softmax(oi)[xi+1]
 
@@ -62,11 +64,11 @@ def cross_entropy_loss(preds: torch.Tensor, targets: torch.Tensor):
     batch_loss = torch.log(torch.sum(out.exp(), dim=-1)) - einsum(out, one_hot, "... vs, ... vs -> ...")
     if batch_loss.dim() == 1:
         batch_loss = torch.unsqueeze(batch_loss, 0)  # Add a dimension to take mean over
-    return batch_loss.flatten(1).mean(1)  # Mean over all except first batch dimension
+    return batch_loss.mean() #flatten(1).mean(1)  # Mean over all except first batch dimension
 
 
-def learning_rate_schedule(t: int, lr_max: float, lr_min: float, warm_up: int,
-                           annealing: int) -> float:
+def cosine_annealing_lr_schedule(t: int, lr_max: float, lr_min: float, warm_up: int,
+                                 annealing: int) -> float:
     """Cosine annealing learning rate schedule
 
     Parameters
@@ -117,3 +119,47 @@ def gradient_clipping(params: list[torch.nn.Parameter], max_norm: float, eps: fl
         if param.grad is None:
             continue
         param.grad.data = grad.mul(max_norm / (total_norm + eps))
+
+
+def get_batch(x: np.ndarray, batch_size: int, context_length: int, device: str = None,
+              pad_val: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
+
+    size = x.shape[0]
+    batch_end_ind = context_length + batch_size + 1
+    if size < batch_end_ind:
+        x_padded = np.pad(x, ((0, batch_end_ind - size),), mode='constant',
+                          constant_values=pad_val)
+        size = x_padded.shape[0]
+    else:
+        x_padded = x
+
+    batch = torch.empty(size=(batch_size, context_length), device=device, dtype=int)
+    targets = torch.empty(size=(batch_size, context_length), device=device, dtype=int)
+
+    start_ind = 0
+    for i in range(batch_size):
+        if size > batch_end_ind:
+            start_ind = np.random.randint(low=0, high=size - context_length)
+
+        batch[i, :] = torch.from_numpy(x_padded[start_ind: start_ind + context_length])
+        targets[i, :] = torch.from_numpy(x_padded[start_ind + 1: start_ind + context_length + 1])
+
+    return batch, targets
+
+
+def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, iteration: int,
+                    out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]):
+    """Dumps all the states into the file-like object out."""
+    states = {"model": model.state_dict(),
+              "optimizer": optimizer.state_dict(),
+              "iteration": iteration}
+    torch.save(states, out)
+
+
+def load_checkpoint(src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+                    model: torch.nn.Module, optimizer: torch.optim.Optimizer):
+    """Load checkpoint form src."""
+    states = torch.load(src)
+    model.load_state_dict(states["model"])
+    optimizer.load_state_dict(states["optimizer"])
+    return states["iteration"]

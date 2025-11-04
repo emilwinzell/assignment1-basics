@@ -146,6 +146,7 @@ class TransformerLM(Module):
                  dtype: torch.dtype = None, rope: RotaryPositionalEmbedding = None):
         super().__init__()
         self.num_layers = num_layers
+        self.context_length = context_length
         self.kwargs = {"device": device, "dtype": dtype}
         self.token_embeddings = Embedding(num_embeddings=vocab_size,
                                           embedding_dim=d_model,

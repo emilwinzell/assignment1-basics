@@ -45,7 +45,7 @@ class AdamW(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group["params"]:
                 state = self.state[p]
-                state["t"] = torch.tensor(1)
+                state["t"] = torch.tensor(1, dtype=p.data.dtype)
                 state["m"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                 state["v"] = torch.zeros_like(p, memory_format=torch.preserve_format)
 

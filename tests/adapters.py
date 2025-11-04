@@ -13,7 +13,8 @@ from cs336_basics.tokenizer import Tokenizer
 from cs336_basics.modules import (Linear, Embedding, RMSNorm, RotaryPositionalEmbedding, SwiGLU,
                                   SiLU)
 from cs336_basics.utils import (softmax, scaled_dot_product_attention, cross_entropy_loss,
-                                learning_rate_schedule, gradient_clipping)
+                                cosine_annealing_lr_schedule, gradient_clipping, get_batch,
+                                save_checkpoint, load_checkpoint)
 from cs336_basics.transformer import MultiHeadSelfAttention, TransformerBlock, TransformerLM
 from cs336_basics.optimizer import AdamW
 
@@ -331,7 +332,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE Theta parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -458,7 +459,7 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    return get_batch(dataset, batch_size, context_length, device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -539,8 +540,8 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    return learning_rate_schedule(t=it, lr_max=max_learning_rate, lr_min=min_learning_rate,
-                                  warm_up=warmup_iters, annealing=cosine_cycle_iters)
+    return cosine_annealing_lr_schedule(t=it, lr_max=max_learning_rate, lr_min=min_learning_rate,
+                                        warm_up=warmup_iters, annealing=cosine_cycle_iters)
 
 
 def run_save_checkpoint(
@@ -559,7 +560,7 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    save_checkpoint(model, optimizer, iteration, out)
 
 
 def run_load_checkpoint(
@@ -580,7 +581,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    return load_checkpoint(src, model, optimizer)
 
 
 def get_tokenizer(
