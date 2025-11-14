@@ -65,7 +65,7 @@ class MultiHeadSelfAttention(Module):
         wvx = rearrange(wvx, "... seq_len (h d_k) -> ... h seq_len d_k", h=self._h)
 
         if self.rope and tk_pos is not None:
-            self.rope.set_max_seq_len(seq_len)
+            # self.rope.set_max_seq_len(seq_len)
             wqx = self.rope.forward(wqx, tk_pos)
             wkx = self.rope.forward(wkx, tk_pos)
 
@@ -162,3 +162,8 @@ class TransformerLM(Module):
         out = self.ln_final.forward(out)
         out = self.lm_head.forward(out)
         return out
+
+    def infer(self, x: torch.Tensor):
+        with torch.no_grad():
+            preds = self.forward(x)
+        return preds

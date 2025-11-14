@@ -5,7 +5,7 @@ import numpy as np
 from einops import einsum
 
 
-def softmax(x: torch.Tensor, i: int) -> torch.Tensor:
+def softmax(x: torch.Tensor, i: int, tau: float = 1.0) -> torch.Tensor:
     """Apply softmax to tensor on a specified dimension
 
     Parameters
@@ -13,12 +13,15 @@ def softmax(x: torch.Tensor, i: int) -> torch.Tensor:
     x : torch.Tensor
     i : int
         The dimension.
+    tau : float, optional
+        Temperature scaling.
 
     Returns
     -------
     torch.Tensor
     """
-    out = x - x.max(dim=i, keepdim=True)[0]
+    tau = max(tau, 0.01)  # Minimum value for numerical stability
+    out = (x - x.max(dim=i, keepdim=True)[0]) / tau
     return out.exp() / torch.sum(out.exp(), dim=i, keepdim=True)
 
 
@@ -54,17 +57,21 @@ def scaled_dot_product_attention(queries: torch.Tensor, keys: torch.Tensor, valu
 
 def cross_entropy_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
-    predicted logits (oi) and targets (xi+1) and computes the cross entropy ℓi = − log softmax(oi)[xi+1]
+    predicted logits (oi) and targets (xi+1) and computes the cross
+    entropy ℓi = − log softmax(oi)[xi+1]
 
     preds = (batch_size ..., vocab_size), targets = (batch_size ...)
     -ln (softmax(oi)) = ln(sum(exp(o))) - oi
     """
     out = preds - preds.max(dim=-1, keepdim=True)[0]
-    one_hot = torch.eye(out.shape[-1])[targets]  # One hot encode targets to retrieve logits with einsum
-    batch_loss = torch.log(torch.sum(out.exp(), dim=-1)) - einsum(out, one_hot, "... vs, ... vs -> ...")
+    # One hot encode targets to retrieve logits with einsum
+    one_hot = torch.eye(out.shape[-1], device=preds.device)[targets]
+    batch_loss = torch.log(
+        torch.sum(out.exp(), dim=-1)
+    ) - einsum(out, one_hot, "... vs, ... vs -> ...")
     if batch_loss.dim() == 1:
         batch_loss = torch.unsqueeze(batch_loss, 0)  # Add a dimension to take mean over
-    return batch_loss.mean() #flatten(1).mean(1)  # Mean over all except first batch dimension
+    return batch_loss.mean()  # Mean over all except first batch dimension
 
 
 def cosine_annealing_lr_schedule(t: int, lr_max: float, lr_min: float, warm_up: int,
@@ -119,6 +126,8 @@ def gradient_clipping(params: list[torch.nn.Parameter], max_norm: float, eps: fl
         if param.grad is None:
             continue
         param.grad.data = grad.mul(max_norm / (total_norm + eps))
+
+    return total_norm
 
 
 def get_batch(x: np.ndarray, batch_size: int, context_length: int, device: str = None,
