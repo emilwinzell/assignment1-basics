@@ -3,6 +3,21 @@ import typing
 import torch
 import numpy as np
 from einops import einsum
+import functools
+
+
+def _no_grad(func):
+    """
+    This wrapper is needed to avoid a circular import when using @torch.no_grad on the exposed
+    functions
+    """
+
+    def _no_grad_wrapper(*args, **kwargs):
+        with torch.no_grad():
+            return func(*args, **kwargs)
+
+    functools.update_wrapper(_no_grad_wrapper, func)
+    return _no_grad_wrapper
 
 
 def softmax(x: torch.Tensor, i: int, tau: float = 1.0) -> torch.Tensor:
@@ -109,12 +124,13 @@ def cosine_annealing_lr_schedule(t: int, lr_max: float, lr_min: float, warm_up: 
         return lr_min + 0.5 * (1 + np.cos(w)) * (lr_max - lr_min)
 
 
+@_no_grad
 def gradient_clipping(params: list[torch.nn.Parameter], max_norm: float, eps: float = 1e-6):
     all_norms = []
     for param in params:
         if param.grad is None:
             continue
-        grad = param.grad.data
+        grad = param.grad
         grad_l2 = torch.linalg.norm(grad, ord=2)
         all_norms.append(grad_l2)
 
@@ -122,12 +138,13 @@ def gradient_clipping(params: list[torch.nn.Parameter], max_norm: float, eps: fl
     if total_norm < max_norm:
         return
 
+    coef = max_norm / (total_norm + eps)
     for param in params:
         if param.grad is None:
             continue
-        param.grad.data = grad.mul(max_norm / (total_norm + eps))
+        param.grad.mul_(coef)
 
-    return total_norm
+    return total_norm.item()
 
 
 def get_batch(x: np.ndarray, batch_size: int, context_length: int, device: str = None,
@@ -168,7 +185,11 @@ def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, it
 def load_checkpoint(src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
                     model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     """Load checkpoint form src."""
-    states = torch.load(src)
+    try:
+        states = torch.load(src)
+    except RuntimeError:
+        states = torch.load(src, map_location=torch.device('cpu'), weights_only=False)
+
     model.load_state_dict(states["model"])
     optimizer.load_state_dict(states["optimizer"])
     return states["iteration"]

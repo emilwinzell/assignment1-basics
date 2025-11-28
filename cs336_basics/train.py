@@ -10,7 +10,6 @@ import wandb
 import yaml
 import argparse
 import time
-import shutil
 
 from .transformer import TransformerLM
 from .optimizer import AdamW
@@ -196,7 +195,6 @@ class Trainer:
         self._last_step = step
 
     def _train_step(self, x: torch.Tensor, y: torch.Tensor):
-
         st_time = time.time()
         log_metrics = {}
         # Update learning rate
@@ -206,15 +204,17 @@ class Trainer:
         # Run model
         preds = self.model.forward(x)
 
-        self.optimizer.zero_grad()  # Reset the gradients for all learnable parameters.
         loss = self.loss_fn(preds, y)
-        loss_out = loss.detach()
+        loss_out = loss.item()
         loss.backward()  # Run backward pass, which computes gradients.
 
         if self.train_args["use_grad_clip"]:
             norm = gradient_clipping(self.model.parameters(), *self.train_args["grad_clip_args"])
 
         self.optimizer.step()  # Run optimizer step.
+
+        # Reset the gradients for all learnable parameters.
+        self.optimizer.zero_grad(set_to_none=False)
 
         log_metrics["train/loss"] = loss_out
         log_metrics["train/gradient_norm"] = norm
@@ -251,7 +251,7 @@ class Trainer:
         if len(chpts) > max_checkpoints:
             checkpt = chpts[0]
             try:
-                shutil.rmtree(checkpt)
+                os.remove(checkpt)
             except OSError as e:
                 print(f"Error in removing old checkpoint: {e.filename} - {e.strerror}.")
 
